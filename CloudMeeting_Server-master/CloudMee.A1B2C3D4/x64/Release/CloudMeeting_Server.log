@@ -1,0 +1,16 @@
+﻿  error.cpp
+  main.cpp
+  net.cpp
+F:\BaiduNetdiskDownload\cloudmeet\CloudMeeting_Server-master\net.cpp(205,90): warning C4267: “参数”: 从“size_t”转换到“socklen_t”，可能丢失数据
+  room.cpp
+F:\BaiduNetdiskDownload\cloudmeet\CloudMeeting_Server-master\room.cpp(63,21): warning C4244: “初始化”: 从“ssize_t”转换到“int”，可能丢失数据
+F:\BaiduNetdiskDownload\cloudmeet\CloudMeeting_Server-master\room.cpp(95,41): warning C4244: “=”: 从“ssize_t”转换到“int”，可能丢失数据
+  userdeal.cpp
+F:\BaiduNetdiskDownload\cloudmeet\CloudMeeting_Server-master\userdeal.cpp(129,23): warning C4244: “初始化”: 从“ssize_t”转换到“int”，可能丢失数据
+F:\BaiduNetdiskDownload\cloudmeet\CloudMeeting_Server-master\userdeal.cpp(130,23): warning C4018: “<”: 有符号/无符号不匹配
+  wrapunix.cpp
+  正在生成代码
+  Previous IPDB not found, fall back to full compilation.
+  All 916 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  已完成代码的生成
+  CloudMeeting_Server.vcxproj -> F:\BaiduNetdiskDownload\cloudmeet\CloudMeeting_Server-master\x64\Release\CloudMeeting_Server.exe

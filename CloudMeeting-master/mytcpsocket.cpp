@@ -1,0 +1,604 @@
+#include "mytcpsocket.h"
+#include "netheader.h"
+#include <QHostAddress>
+#include <QtEndian>
+#include <QMetaObject>
+#include <QMutexLocker>
+
+extern QUEUE_DATA<MESG> queue_send;
+extern QUEUE_DATA<MESG> queue_recv;
+extern QUEUE_DATA<MESG> audio_recv;
+
+// 手动大端解析，绕过 Qt 6 qFromBigEndian 3参数重载的潜在匹配问题
+static inline quint32 read_be32(const uchar* p)
+{
+    return ((quint32)p[0] << 24) | ((quint32)p[1] << 16) | ((quint32)p[2] << 8) | (quint32)p[3];
+}
+static inline quint16 read_be16(const uchar* p)
+{
+    return ((quint16)p[0] << 8) | (quint16)p[1];
+}
+
+void MyTcpSocket::stopImmediately()
+{
+    {
+        QMutexLocker lock(&m_lock);
+        if(m_isCanRun == true) m_isCanRun = false;
+    }
+    //关闭read
+    _sockThread->quit();
+    _sockThread->wait();
+}
+
+void MyTcpSocket::closeSocket()
+{
+	if (_socktcp && _socktcp->isOpen())
+	{
+		_socktcp->close();
+	}
+}
+
+MyTcpSocket::MyTcpSocket(QObject *par):QThread(par)
+{
+    qRegisterMetaType<QAbstractSocket::SocketError>();
+	_socktcp = nullptr;
+
+    _sockThread = new QThread(); //发送数据线程
+    this->moveToThread(_sockThread);
+	connect(_sockThread, SIGNAL(finished()), this, SLOT(closeSocket()));
+    sendbuf =(uchar *) malloc(4 * MB);
+    recvbuf = (uchar*)malloc(4 * MB);
+    hasrecvive = 0;
+
+}
+
+
+void MyTcpSocket::errorDetect(QAbstractSocket::SocketError error)
+{
+    qDebug() <<"Sock error" <<QThread::currentThreadId();
+    MESG * msg = (MESG *) malloc(sizeof (MESG));
+    if (msg == NULL)
+    {
+        qDebug() << "errdect malloc error";
+    }
+    else
+    {
+        memset(msg, 0, sizeof(MESG));
+		if (error == QAbstractSocket::RemoteHostClosedError)
+		{
+			msg->msg_type = RemoteHostClosedError;
+		}
+		else
+		{
+			msg->msg_type = OtherNetError;
+		}
+		queue_recv.push_msg(msg);
+    }
+}
+
+
+
+void MyTcpSocket::sendData(MESG* send)
+{
+	if (_socktcp->state() == QAbstractSocket::UnconnectedState)
+	{
+        emit sendTextOver();
+		if (send->data) free(send->data);
+		if (send) free(send);
+		return;
+	}
+	quint64 bytestowrite = 0;
+	//构造消息头
+	sendbuf[bytestowrite++] = '$';
+
+	//消息类型
+	qToBigEndian<quint16>(send->msg_type, sendbuf + bytestowrite);
+	bytestowrite += 2;
+
+	//发送者ip
+	quint32 ip = _socktcp->localAddress().toIPv4Address();
+	qToBigEndian<quint32>(ip, sendbuf + bytestowrite);
+	bytestowrite += 4;
+
+    if (send->msg_type == CREATE_MEETING || send->msg_type == AUDIO_SEND || send->msg_type == CLOSE_CAMERA || send->msg_type == IMG_SEND || send->msg_type == TEXT_SEND) //创建会议,发送音频,关闭摄像头，发送图片
+	{
+		//发送数据大小
+		qToBigEndian<quint32>(send->len, sendbuf + bytestowrite);
+		bytestowrite += 4;
+	}
+	else if (send->msg_type == JOIN_MEETING)
+	{
+		qToBigEndian<quint32>(send->len, sendbuf + bytestowrite);
+		bytestowrite += 4;
+		uint32_t room;
+		memcpy(&room, send->data, send->len);
+		qToBigEndian<quint32>(room, sendbuf + bytestowrite);
+		bytestowrite += send->len;
+	}
+	else
+	{
+		//将数据拷入sendbuf
+		memcpy(sendbuf + bytestowrite, send->data, send->len);
+		bytestowrite += send->len;
+	}
+	sendbuf[bytestowrite++] = '#'; //结尾字符
+
+	//----------------write to server-------------------------
+	qint64 hastowrite = bytestowrite;
+	qint64 haswrite = 0;
+	while (haswrite < hastowrite)
+	{
+		qint64 ret = _socktcp->write((char*)sendbuf + haswrite, hastowrite - haswrite);
+		if (ret == -1 && _socktcp->error() == QAbstractSocket::TemporaryError)
+		{
+			ret = 0;
+		}
+		else if (ret == -1)
+		{
+			qDebug() << "network error";
+			break;
+		}
+		haswrite += ret;
+	}
+
+	_socktcp->waitForBytesWritten();
+
+    if(send->msg_type == TEXT_SEND)
+    {
+        emit sendTextOver(); //成功往内核发送文本信息
+    }
+
+
+	if (send->data)
+	{
+		free(send->data);
+	}
+	//free
+	if (send)
+	{
+		free(send);
+	}
+}
+
+/*
+ * 发送线程
+ */
+void MyTcpSocket::run()
+{
+    //qDebug() << "send data" << QThread::currentThreadId();
+    m_isCanRun = true; //标记可以运行
+    /*
+    *$_MSGType_IPV4_MSGSize_data_# //
+    * 1 2 4 4 MSGSize 1
+    *底层写数据线程
+    */
+    for(;;)
+    {
+        {
+            QMutexLocker locker(&m_lock);
+            if(m_isCanRun == false) return; //在每次循环判断是否可以运行，如果不行就退出循环
+        }
+        
+        //构造消息体
+        MESG * send = queue_send.pop_msg();
+        if(send == NULL) continue;
+        QMetaObject::invokeMethod(this, "sendData", Q_ARG(MESG*, send));
+    }
+}
+
+
+qint64 MyTcpSocket::readn(char * buf, quint64 maxsize, int n)
+{
+    quint64 hastoread = n;
+    quint64 hasread = 0;
+    do
+    {
+        qint64 ret  = _socktcp->read(buf + hasread, hastoread);
+        if(ret < 0)
+        {
+            return -1;
+        }
+        if(ret == 0)
+        {
+            return hasread;
+        }
+        hasread += ret;
+        hastoread -= ret;
+    }while(hastoread > 0 && hasread < maxsize);
+    return hasread;
+}
+
+
+void MyTcpSocket::recvFromSocket()
+{
+
+    //qDebug() << "recv data socket" <<QThread::currentThread();
+    /*
+    *$_msgtype_ip_size_data_#
+    */
+    qint64 availbytes = _socktcp->bytesAvailable();
+	if (availbytes <=0 )
+	{
+		return;
+	}
+    qint64 maxread = qMin(availbytes, (qint64)(4 * MB - hasrecvive));
+    qint64 ret = _socktcp->read((char *) recvbuf + hasrecvive, maxread);
+    if (ret <= 0)
+    {
+        qDebug() << "error or no more data";
+		return;
+    }
+    hasrecvive += ret;
+
+    //数据包不够
+    while (hasrecvive >= MSG_HEADER)
+    {
+        // 同步到帧头 '$'
+        if (recvbuf[0] != '$')
+        {
+            memmove_s(recvbuf, 4 * MB, recvbuf + 1, hasrecvive - 1);
+            hasrecvive -= 1;
+            continue;
+        }
+
+        quint32 data_size = read_be32(recvbuf + 7);
+        // 底层调试：打印收到的原始字节
+        QString hexStr;
+        for (quint64 i = 0; i < qMin((quint64)16, hasrecvive); i++)
+            hexStr.append(QString("%1 ").arg(recvbuf[i], 2, 16, QChar('0')));
+        qDebug() << "RAW recvbuf[0:" << qMin((quint64)16, hasrecvive)-1 << "] hex:" << hexStr << "hasrecvive=" << hasrecvive << "data_size=" << data_size;
+
+        // 防御：data_size 不能超过缓冲区容量
+        if (data_size > 4 * MB - MSG_HEADER - 1)
+        {
+            qDebug() << "data_size too large, drop all:" << data_size;
+            hasrecvive = 0;
+            memset(recvbuf, 0, 4 * MB);
+            return;
+        }
+
+        if ((quint64)data_size + 1 + MSG_HEADER > hasrecvive) //数据不够一个包
+        {
+            return;
+        }
+
+        if (recvbuf[MSG_HEADER + data_size] != '#') //包尾不对
+        {
+            qDebug() << "package tail error, resync";
+            memmove_s(recvbuf, 4 * MB, recvbuf + 1, hasrecvive - 1);
+            hasrecvive -= 1;
+            continue;
+        }
+
+        // 包结构正确，处理消息
+        {
+				MSG_TYPE msgtype;
+								uint16_t type = read_be16(recvbuf + 1);
+				msgtype = (MSG_TYPE)type;
+				qDebug() << "recv data type: " << msgtype;
+				if (msgtype == CREATE_MEETING_RESPONSE || msgtype == JOIN_MEETING_RESPONSE || msgtype == PARTNER_JOIN2)
+				{
+					if (msgtype == CREATE_MEETING_RESPONSE)
+					{
+						qint32 roomNo;
+						roomNo = (qint32)read_be32(recvbuf + MSG_HEADER);
+						qDebug() << "recv CREATE_MEETING_RESPONSE roomNo=" << roomNo << "data_size=" << data_size;
+
+						MESG* msg = (MESG*)malloc(sizeof(MESG));
+
+						if (msg == NULL)
+						{
+							qDebug() << __LINE__ << " CREATE_MEETING_RESPONSE malloc MESG failed";
+						}
+						else
+						{
+							memset(msg, 0, sizeof(MESG));
+							msg->msg_type = msgtype;
+							// 房间号固定4字节，防御 data_size 解析异常
+							quint32 alloc_len = (data_size == 0 && roomNo != 0) ? sizeof(quint32) : data_size;
+							msg->data = (uchar*)malloc((quint64)alloc_len);
+							if (msg->data == NULL)
+							{
+								free(msg);
+								qDebug() << __LINE__ << "CREATE_MEETING_RESPONSE malloc MESG.data failed";
+							}
+							else
+							{
+								memset(msg->data, 0, (quint64)alloc_len);
+								memcpy(msg->data, &roomNo, sizeof(quint32));
+								msg->len = alloc_len;
+								queue_recv.push_msg(msg);
+							}
+
+						}
+					}
+					else if (msgtype == JOIN_MEETING_RESPONSE)
+					{
+						qint32 c = 0;
+						if (data_size >= sizeof(quint32))
+						{
+							c = (qint32)read_be32(recvbuf + MSG_HEADER);
+						}
+
+						MESG* msg = (MESG*)malloc(sizeof(MESG));
+
+						if (msg == NULL)
+						{
+							qDebug() << __LINE__ << "JOIN_MEETING_RESPONSE malloc MESG failed";
+						}
+						else
+						{
+							memset(msg, 0, sizeof(MESG));
+							msg->msg_type = msgtype;
+							msg->data = (uchar*)malloc(sizeof(qint32));
+							if (msg->data == NULL)
+							{
+								free(msg);
+								qDebug() << __LINE__ << "JOIN_MEETING_RESPONSE malloc MESG.data failed";
+							}
+							else
+							{
+								memset(msg->data, 0, sizeof(qint32));
+								memcpy(msg->data, &c, sizeof(qint32));
+
+								msg->len = sizeof(qint32);
+								queue_recv.push_msg(msg);
+							}
+						}
+					}
+					else if (msgtype == PARTNER_JOIN2)
+					{
+						MESG* msg = (MESG*)malloc(sizeof(MESG));
+						if (msg == NULL)
+						{
+							qDebug() << "PARTNER_JOIN2 malloc MESG error";
+						}
+						else
+						{
+							memset(msg, 0, sizeof(MESG));
+							msg->msg_type = msgtype;
+							msg->len = data_size;
+							msg->data = (uchar*)malloc(data_size);
+							if (msg->data == NULL)
+							{
+								free(msg);
+								qDebug() << "PARTNER_JOIN2 malloc MESG.data error";
+							}
+							else
+							{
+								memset(msg->data, 0, data_size);
+								uint32_t ip;
+								int pos = 0;
+								for (quint64 i = 0; i < data_size / sizeof(uint32_t); i++)
+								{
+									ip = read_be32(recvbuf + MSG_HEADER + pos);
+									memcpy_s(msg->data + pos, data_size - pos, &ip, sizeof(uint32_t));
+									pos += sizeof(uint32_t);
+								}
+								queue_recv.push_msg(msg);
+							}
+
+						}
+					}
+				}
+                else if (msgtype == IMG_RECV || msgtype == PARTNER_JOIN || msgtype == PARTNER_EXIT || msgtype == AUDIO_RECV || msgtype == CLOSE_CAMERA || msgtype == TEXT_RECV)
+				{
+					//read ipv4
+					quint32 ip;
+					ip = read_be32(recvbuf + 3);
+
+					if (msgtype == IMG_RECV)
+					{
+						//QString ss = QString::fromLatin1((char *)recvbuf + MSG_HEADER, data_len);
+						QByteArray cc((char *) recvbuf + MSG_HEADER, data_size);
+						QByteArray rc = QByteArray::fromBase64(cc);
+						QByteArray rdc = qUncompress(rc);
+						//将消息加入到接收队列
+		//                qDebug() << roomNo;
+						
+						if (rdc.size() > 0)
+						{
+							MESG* msg = (MESG*)malloc(sizeof(MESG));
+							if (msg == NULL)
+							{
+								qDebug() << __LINE__ << " malloc failed";
+							}
+							else
+							{
+								memset(msg, 0, sizeof(MESG));
+								msg->msg_type = msgtype;
+								msg->data = (uchar*)malloc(rdc.size()); // 10 = format + width + width
+								if (msg->data == NULL)
+								{
+									free(msg);
+									qDebug() << __LINE__ << " malloc failed";
+								}
+								else
+								{
+									memset(msg->data, 0, rdc.size());
+									memcpy_s(msg->data, rdc.size(), rdc.data(), rdc.size());
+									msg->len = rdc.size();
+									msg->ip = ip;
+									queue_recv.push_msg(msg);
+								}
+							}
+						}
+					}
+					else if (msgtype == PARTNER_JOIN || msgtype == PARTNER_EXIT || msgtype == CLOSE_CAMERA)
+					{
+						MESG* msg = (MESG*)malloc(sizeof(MESG));
+						if (msg == NULL)
+						{
+							qDebug() << __LINE__ << " malloc failed";
+						}
+						else
+						{
+							memset(msg, 0, sizeof(MESG));
+							msg->msg_type = msgtype;
+							msg->ip = ip;
+							queue_recv.push_msg(msg);
+						}
+					}
+					else if (msgtype == AUDIO_RECV)
+					{
+						//解压缩
+						QByteArray cc((char*)recvbuf + MSG_HEADER, data_size);
+						QByteArray rc = QByteArray::fromBase64(cc);
+						QByteArray rdc = qUncompress(rc);
+
+						if (rdc.size() > 0)
+						{
+							MESG* msg = (MESG*)malloc(sizeof(MESG));
+							if (msg == NULL)
+							{
+								qDebug() << __LINE__ << "malloc failed";
+							}
+							else
+							{
+								memset(msg, 0, sizeof(MESG));
+								msg->msg_type = AUDIO_RECV;
+								msg->ip = ip;
+
+								msg->data = (uchar*)malloc(rdc.size());
+								if (msg->data == nullptr)
+								{
+                                    free(msg);
+									qDebug() << __LINE__ << "malloc msg.data failed";
+								}
+								else
+								{
+									memset(msg->data, 0, rdc.size());
+									memcpy_s(msg->data, rdc.size(), rdc.data(), rdc.size());
+									msg->len = rdc.size();
+									msg->ip = ip;
+									audio_recv.push_msg(msg);
+								}
+							}
+						}
+					}
+                    else if(msgtype == TEXT_RECV)
+                    {
+                        //解压缩
+                        QByteArray cc((char *)recvbuf + MSG_HEADER, data_size);
+                        std::string rr = qUncompress(cc).toStdString();
+                        if(rr.size() > 0)
+                        {
+                            MESG* msg = (MESG*)malloc(sizeof(MESG));
+                            if (msg == NULL)
+                            {
+                                qDebug() << __LINE__ << "malloc failed";
+                            }
+                            else
+                            {
+                                memset(msg, 0, sizeof(MESG));
+                                msg->msg_type = TEXT_RECV;
+                                msg->ip = ip;
+                                msg->data = (uchar*)malloc(rr.size());
+                                if (msg->data == nullptr)
+                                {
+                                    free(msg);
+                                    qDebug() << __LINE__ << "malloc msg.data failed";
+                                }
+                                else
+                                {
+                                    memset(msg->data, 0, rr.size());
+                                    memcpy_s(msg->data, rr.size(), rr.data(), rr.size());
+                                    msg->len = rr.size();
+                                    queue_recv.push_msg(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+			}
+        // 移动剩余数据到缓冲区头部
+		memmove_s(recvbuf, 4 * MB, recvbuf + MSG_HEADER + data_size + 1, hasrecvive - ((quint64)data_size + 1 + MSG_HEADER));
+		hasrecvive -= ((quint64)data_size + 1 + MSG_HEADER);
+    }
+}
+
+
+MyTcpSocket::~MyTcpSocket()
+{
+    free(sendbuf);
+    free(recvbuf);
+    delete _sockThread;
+}
+
+
+
+bool MyTcpSocket::connectServer(QString ip, QString port, QIODevice::OpenModeFlag flag)
+{
+    hasrecvive = 0;
+    if(recvbuf) memset(recvbuf, 0, 4 * MB);
+    if(_socktcp == nullptr) _socktcp = new QTcpSocket(); //tcp
+    _socktcp->connectToHost(ip, port.toUShort(), flag);
+    connect(_socktcp, SIGNAL(readyRead()), this, SLOT(recvFromSocket()), Qt::UniqueConnection); //接受数据
+    //处理套接字错误
+    connect(_socktcp, SIGNAL(error(QAbstractSocket::SocketError)), this, SLOT(errorDetect(QAbstractSocket::SocketError)),Qt::UniqueConnection);
+
+    if(_socktcp->waitForConnected(5000))
+    {
+        return true;
+    }
+	_socktcp->close();
+    return false;
+}
+
+
+bool MyTcpSocket::connectToServer(QString ip, QString port, QIODevice::OpenModeFlag flag)
+{
+	_sockThread->start(); // 开启链接，与接受
+	bool retVal;
+	QMetaObject::invokeMethod(this, "connectServer", Qt::BlockingQueuedConnection, Q_RETURN_ARG(bool, retVal),
+								Q_ARG(QString, ip), Q_ARG(QString, port), Q_ARG(QIODevice::OpenModeFlag, flag));
+
+	if (retVal)
+	{
+        this->start() ; //写数据
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+}
+
+QString MyTcpSocket::errorString()
+{
+    return _socktcp->errorString();
+}
+
+void MyTcpSocket::disconnectFromHost()
+{
+    //write
+    if(this->isRunning())
+    {
+        QMutexLocker locker(&m_lock);
+        m_isCanRun = false;
+    }
+
+    if(_sockThread->isRunning()) //read
+    {
+        _sockThread->quit();
+        _sockThread->wait();
+    }
+
+    //清空 发送 队列，清空接受队列
+    queue_send.clear();
+    queue_recv.clear();
+	audio_recv.clear();
+}
+
+
+quint32 MyTcpSocket::getlocalip()
+{
+    if(_socktcp->isOpen())
+    {
+        return _socktcp->localAddress().toIPv4Address();
+    }
+    else
+    {
+        return -1;
+    }
+}
